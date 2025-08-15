@@ -59,16 +59,17 @@ HIGHWAY_TAGS = [
     "tertiary",
 ]
 
-# Line weights (final image pixels) matching original script intent
 LAYER_STYLES = {
-    "tertiary": 1,
-    "secondary": 1,
-    "primary": 2,
-    "trunk": 3,
-    "motorway": 4,
-    "borders": 6,
-    "water": 2,
-    "railway": 2,
+    "borders": {"thickness": 6, "color": 0},  # Dark gray for borders
+    #
+    "motorway": {"thickness": 2, "color": 0},  # Very dark gray (main roads)
+    "trunk": {"thickness": 1, "color": 0},  # Dark gray
+    "primary": {"thickness": 1, "color": 0.2},  # Medium-dark gray
+    "secondary": {"thickness": 1, "color": 0.4},  # Medium gray
+    "tertiary": {"thickness": 1, "color": 0.8},  # Lighter gray (brighter)
+    #
+    "water": {"thickness": 2, "color": 0},  # Medium-dark gray for water
+    "railways": {"thickness": 1, "color": 0},  # Dark gray for railways
 }
 
 
@@ -81,7 +82,6 @@ class Config:
         output,
         render_types=None,
         verbose=False,
-        disable_oiio=False,
     ):
         self.bbox = bbox  # (min_lon, min_lat, max_lon, max_lat)
         self.width = width
@@ -89,11 +89,9 @@ class Config:
         self.output = output if isinstance(output, Path) else Path(output)
         self.render_types = render_types or ["roads", "borders"]
         self.verbose = verbose
-        self.disable_oiio = disable_oiio
 
-        # Auto-enable tiling and 16-bit for EXR outputs (unless disabled)
+        # Check if output is EXR format
         self.is_exr = self.output.suffix.lower() == ".exr"
-        self.use_oiio = self.is_exr and not disable_oiio
 
 
 # ---------------------- Utility / IO ------------------------------------ #
@@ -180,7 +178,7 @@ def make_highways_query(bbox):
         highway,
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
-        "public"."osm_filtered_data"
+        "public"."osm_roads"
     WHERE
         way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
         AND "highway" IN ({highway_filter});
@@ -194,7 +192,7 @@ def make_water_query(bbox):
     SELECT
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
-        "public"."osm_filtered_data"
+        "public"."osm_waterways"
     WHERE
         way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
         AND "waterway" = 'river'
@@ -203,16 +201,15 @@ def make_water_query(bbox):
     return query
 
 
-def make_railway_query(bbox):
+def make_railways_query(bbox):
     min_lon, min_lat, max_lon, max_lat = bbox
     query = f"""
     SELECT
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
-        "public"."osm_filtered_data"
+        "public"."osm_railways"
     WHERE
         way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
-        AND "railway" IN ('rail', 'subway', 'light_rail');
     """
     return query
 
@@ -280,21 +277,19 @@ def extract_railway_lines(results):
 
 
 def lonlat_to_pixel_batch(coords, bbox, w, h, shift=4):
-    """Vectorized coordinate transformation with sub-pixel precision"""
+    """Vectorized coordinate transformation with sub-pixel precision."""
     min_lon, min_lat, max_lon, max_lat = bbox
     lon_range = max_lon - min_lon
     lat_range = max_lat - min_lat
 
     coords_array = np.array(coords)
-
     shift_factor = 1 << shift
 
     # Keep floating point precision for sub-pixel accuracy
     x = (coords_array[:, 0] - min_lon) / lon_range * w * shift_factor
     y = (max_lat - coords_array[:, 1]) / lat_range * h * shift_factor
 
-    # CRITICAL FIX: Round before casting to integer
-    # This preserves the sub-pixel information correctly
+    # Round before casting to integer
     return np.column_stack((np.round(x).astype(np.int32), np.round(y).astype(np.int32)))
 
 
@@ -335,14 +330,9 @@ def draw_polygons_opencv(img, polygons, bbox, scaled_w, scaled_h, color, shift=4
 
 
 def draw_lines_opencv(img, lines, bbox, scaled_w, scaled_h, thickness, color, shift=4):
-    """Optimized line drawing using OpenCV with sub-pixel precision"""
+    """Optimized line drawing using OpenCV with sub-pixel precision."""
     total_lines = 0
     start_time = time.time()
-    shift_factor = 1 << shift  # 2^shift (e.g., 16 for shift=4)
-
-    # Scale thickness for float32 images
-    if img.dtype == np.float32:
-        thickness = max(1, int(thickness))
 
     for line in lines:
         if len(line) < 2:
@@ -351,24 +341,15 @@ def draw_lines_opencv(img, lines, bbox, scaled_w, scaled_h, thickness, color, sh
         # Convert coordinates in batch using numpy with sub-pixel precision
         pts = lonlat_to_pixel_batch(line, bbox, scaled_w, scaled_h, shift)
 
-        # Simple culling - skip lines completely outside image bounds (in shifted coordinates)
-        if len(pts) > 0:
-            min_x, min_y = pts.min(axis=0)
-            max_x, max_y = pts.max(axis=0)
-
-            # Convert bounds to shifted coordinate space for comparison
-            if (
-                max_x < 0
-                or min_x > (scaled_w * shift_factor)
-                or max_y < 0
-                or min_y > (scaled_h * shift_factor)
-            ):
-                continue
-
-        # Draw polyline with OpenCV using sub-pixel precision
         if len(pts) > 1:
             cv2.polylines(
-                img, [pts], False, color, thickness, lineType=cv2.LINE_AA, shift=shift
+                img,
+                [pts],
+                isClosed=False,
+                color=color,
+                thickness=thickness,
+                lineType=cv2.LINE_AA,
+                shift=shift,
             )
             total_lines += 1
 
@@ -377,19 +358,20 @@ def draw_lines_opencv(img, lines, bbox, scaled_w, scaled_h, thickness, color, sh
 
 
 def render_single_layer(
-    cfg, layer_name, highway_layers, border_polygons, water_lines, railway_lines
+    cfg, layer_name, highway_layers, border_polygons, water_lines, railways_lines
 ):
     """Render a single layer type to its own image"""
-    # Create OpenCV image (32-bit float format, black background) for EXR output
-    img = np.zeros((cfg.height, cfg.width, 3), dtype=np.float32)
+    # Create OpenCV image (32-bit float format, white background) for better antialiasing visibility
+    img = np.full((cfg.height, cfg.width, 3), 255, dtype=np.uint8)
 
     # Pre-calculate bbox values for performance
     bbox_cached = cfg.bbox
 
-    # Define colors in BGR format (OpenCV uses BGR, not RGB) - white for all elements
-    colors = {
-        "white": (1.0, 1.0, 1.0),  # White in float format for EXR
-    }
+    # Define a function to convert grayscale value to BGR color
+    def grayscale_to_bgr(gray_value):
+        """Convert grayscale value (0.0-1.0) to BGR tuple for OpenCV (0-255 range)"""
+        gray_255 = int(gray_value * 255)
+        return (gray_255, gray_255, gray_255)
 
     # Draw in order of thickness (smallest first)
     draw_order = ["tertiary", "secondary", "primary", "trunk", "motorway"]
@@ -403,10 +385,12 @@ def render_single_layer(
             lines = highway_layers.get(name, [])
             if not lines:
                 continue
-            # Use base thickness with OpenCV LINE_AA antialiasing
-            thickness = LAYER_STYLES[name]
+            # Get thickness and color from layer styles
+            layer_style = LAYER_STYLES[name]
+            thickness = layer_style["thickness"]
+            color = grayscale_to_bgr(layer_style["color"])
             log(
-                f"[Render] Drawing {len(lines)} {name} lines (thickness {thickness}px)",
+                f"[Render] Drawing {len(lines)} {name} lines (thickness {thickness}px, color {layer_style['color']})",
                 cfg,
             )
 
@@ -418,7 +402,7 @@ def render_single_layer(
                 cfg.width,
                 cfg.height,
                 thickness,
-                colors["white"],
+                color,
             )
             log_timing(layer_start, f"Drawing {name} layer ({drawn_count} lines)", cfg)
 
@@ -426,7 +410,9 @@ def render_single_layer(
 
     elif layer_name == "water" and water_lines:
         log(f"[Render] Drawing {len(water_lines)} water lines...", cfg)
-        thickness = LAYER_STYLES["water"]
+        layer_style = LAYER_STYLES["water"]
+        thickness = layer_style["thickness"]
+        color = grayscale_to_bgr(layer_style["color"])
 
         water_start = time.time()
         drawn_count, draw_time = draw_lines_opencv(
@@ -436,118 +422,150 @@ def render_single_layer(
             cfg.width,
             cfg.height,
             thickness,
-            colors["white"],
+            color,
         )
         log_timing(water_start, f"Water rendering ({drawn_count} lines)", cfg)
 
-    elif layer_name == "railway" and railway_lines:
-        log(f"[Render] Drawing {len(railway_lines)} railway lines...", cfg)
-        thickness = LAYER_STYLES["railway"]
+    elif layer_name == "railways" and railways_lines:
+        log(f"[Render] Drawing {len(railways_lines)} railways lines...", cfg)
+        layer_style = LAYER_STYLES["railways"]
+        thickness = layer_style["thickness"]
+        color = grayscale_to_bgr(layer_style["color"])
 
-        railway_start = time.time()
+        railways_start = time.time()
         drawn_count, draw_time = draw_lines_opencv(
             img,
-            railway_lines,
+            railways_lines,
             bbox_cached,
             cfg.width,
             cfg.height,
             thickness,
-            colors["white"],
+            color,
         )
-        log_timing(railway_start, f"Railway rendering ({drawn_count} lines)", cfg)
+        log_timing(railways_start, f"Railways rendering ({drawn_count} lines)", cfg)
 
     elif layer_name == "borders" and border_polygons:
         log(f"[Render] Drawing {len(border_polygons)} border polygons...", cfg)
+        layer_style = LAYER_STYLES["borders"]
+        color = grayscale_to_bgr(layer_style["color"])
 
         borders_start = time.time()
         drawn_count, draw_time = draw_polygons_opencv(
-            img, border_polygons, bbox_cached, cfg.width, cfg.height, colors["white"]
+            img, border_polygons, bbox_cached, cfg.width, cfg.height, color
         )
         log_timing(borders_start, f"Borders rendering ({drawn_count} polygons)", cfg)
 
-    # Generate output filename for this layer - use appropriate extension
+    # Generate output filename for this layer - determine final extension
     file_ext = cfg.output.suffix if cfg.output.suffix else ".exr"
-    output_path = cfg.output.parent / f"{cfg.output.stem}_{layer_name}{file_ext}"
+    final_output_path = cfg.output.parent / f"{cfg.output.stem}_{layer_name}{file_ext}"
 
-    # Save the image
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    log(f"[Render] Saving {layer_name} layer to {output_path}...", cfg)
+    # Create output directory
+    final_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     save_start = time.time()
 
-    if file_ext.lower() == ".exr":
-        # EXR output with ZIP compression
-        exr_params = [cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP]
-        success = cv2.imwrite(str(output_path), img, exr_params)
-        if not success:
-            raise RuntimeError(f"Failed to save EXR image: {output_path}")
-        log_timing(
-            save_start, f"{layer_name} 32-bit EXR file write (ZIP compressed)", cfg
+    if file_ext.lower() == ".webp":
+        # Write directly as WebP
+        log(
+            f"[Render] Saving {layer_name} layer as WebP to {final_output_path}...", cfg
         )
-    else:
-        # Other formats (PNG, WebP, etc.) - convert to 8-bit
-        img_8bit = (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
-        if file_ext.lower() == ".webp":
-            # WebP with quality setting
-            webp_params = [cv2.IMWRITE_WEBP_QUALITY, 90]
-            success = cv2.imwrite(str(output_path), img_8bit, webp_params)
-        else:
-            # PNG or other formats
-            success = cv2.imwrite(str(output_path), img_8bit)
+        # Convert float32 to 8-bit for WebP
+        img_8bit = np.round(np.clip(img, 0, 1) * 255).astype(np.uint8)
+        webp_params = [cv2.IMWRITE_WEBP_QUALITY, 90]
+        success = cv2.imwrite(str(final_output_path), img_8bit, webp_params)
 
         if not success:
-            raise RuntimeError(
-                f"Failed to save {file_ext.upper()} image: {output_path}"
-            )
-        log_timing(save_start, f"{layer_name} {file_ext.upper()} file write", cfg)
+            raise RuntimeError(f"Failed to save WebP image: {final_output_path}")
+        log_timing(save_start, f"{layer_name} WebP file write", cfg)
 
-    # Clean up
-    del img
-    if "img_8bit" in locals():
+        # Clean up
+        del img
         del img_8bit
 
-    # Post-process EXR files with oiiotool (tiling + 16-bit) unless disabled
-    if cfg.use_oiio:
-        log(f"[Post-process] Running oiiotool on {output_path}...", cfg)
-        postprocess_start = time.time()
+        return final_output_path
 
-        # Create output filename for processed version
-        processed_path = output_path.parent / f"{output_path.stem}.exr"
+    elif file_ext.lower() == ".exr":
+        # For EXR output, save to PNG first, then use oiiotool to convert
+        log(
+            f"[Render] Saving {layer_name} layer as PNG first, then converting to EXR...",
+            cfg,
+        )
 
-        # Build oiiotool command: tile 64x64 + convert to half precision
-        cmd = [
+        # Create temporary PNG path
+        temp_png_path = cfg.output.parent / f"{cfg.output.stem}_{layer_name}.png"
+
+        # Save as PNG first
+        success = cv2.imwrite(str(temp_png_path), img)
+
+        if not success:
+            raise RuntimeError(f"Failed to save temporary PNG image: {temp_png_path}")
+        log_timing(save_start, f"{layer_name} PNG file write", cfg)
+
+        # Use oiiotool to convert PNG to EXR
+        log("[Render] Converting PNG to EXR using oiiotool...", cfg)
+        oiio_start = time.time()
+
+        oiiotool_cmd = [
             "oiiotool",
-            str(output_path),
+            str(temp_png_path),
             "--tile",
             "64",
             "64",
             "-d",
             "half",
+            "-compression",
+            "zip",
             "-o",
-            str(processed_path),
+            str(final_output_path),
         ]
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            log_timing(postprocess_start, "oiiotool processing", cfg)
-            log(f"[Post-process] Saved processed version to {processed_path}", cfg)
-            return processed_path
+            subprocess.run(oiiotool_cmd, check=True, capture_output=True, text=True)
+            log_timing(oiio_start, f"{layer_name} oiiotool conversion", cfg)
+
+            # Remove the temporary PNG file
+            temp_png_path.unlink()
+            log(f"[Render] Removed temporary PNG file: {temp_png_path}", cfg)
+
         except subprocess.CalledProcessError as e:
-            log(f"[Post-process] oiiotool failed: {e.stderr}", cfg, force=True)
-            return output_path
+            # Clean up temp file even if conversion fails
+            if temp_png_path.exists():
+                temp_png_path.unlink()
+            raise RuntimeError(f"oiiotool conversion failed: {e.stderr}")
         except FileNotFoundError:
-            log(
-                "[Post-process] oiiotool not found in PATH, skipping post-processing",
-                cfg,
-                force=True,
+            # Clean up temp file if oiiotool is not found
+            if temp_png_path.exists():
+                temp_png_path.unlink()
+            raise RuntimeError(
+                "oiiotool command not found. Please ensure OpenImageIO is installed."
             )
-            return output_path
 
-    return output_path
+        # Clean up
+        del img
+
+        return final_output_path
+
+    else:
+        # For PNG output only
+        png_output_path = cfg.output.parent / f"{cfg.output.stem}_{layer_name}.png"
+        log(f"[Render] Saving {layer_name} layer as PNG to {png_output_path}...", cfg)
+
+        success = cv2.imwrite(str(png_output_path), img)
+
+        if not success:
+            raise RuntimeError(f"Failed to save PNG image: {png_output_path}")
+        log_timing(save_start, f"{layer_name} 8-bit PNG file write", cfg)
+
+        # Clean up
+        del img
+
+        # For PNG output, rename the file to the final path
+        png_output_path.rename(final_output_path)
+        return final_output_path
 
 
-def render(cfg, highway_layers, border_polygons, water_lines, railway_lines):
+def render(cfg, highway_layers, border_polygons, water_lines, railways_lines):
     """Render all requested layers to separate files"""
     output_paths = []
 
@@ -559,7 +577,7 @@ def render(cfg, highway_layers, border_polygons, water_lines, railway_lines):
                 highway_layers,
                 border_polygons,
                 water_lines,
-                railway_lines,
+                railways_lines,
             )
             output_paths.append(path)
         elif layer_name == "water" and water_lines:
@@ -569,17 +587,17 @@ def render(cfg, highway_layers, border_polygons, water_lines, railway_lines):
                 highway_layers,
                 border_polygons,
                 water_lines,
-                railway_lines,
+                railways_lines,
             )
             output_paths.append(path)
-        elif layer_name == "railway" and railway_lines:
+        elif layer_name == "railways" and railways_lines:
             path = render_single_layer(
                 cfg,
                 layer_name,
                 highway_layers,
                 border_polygons,
                 water_lines,
-                railway_lines,
+                railways_lines,
             )
             output_paths.append(path)
         elif layer_name == "borders" and border_polygons:
@@ -589,7 +607,7 @@ def render(cfg, highway_layers, border_polygons, water_lines, railway_lines):
                 highway_layers,
                 border_polygons,
                 water_lines,
-                railway_lines,
+                railways_lines,
             )
             output_paths.append(path)
 
@@ -609,7 +627,7 @@ def run(cfg):
     highway_layers = {tag: [] for tag in HIGHWAY_TAGS}
     border_polygons = []
     water_lines = []
-    railway_lines = []
+    railways_lines = []
 
     # Highways
     if "roads" in cfg.render_types:
@@ -644,17 +662,19 @@ def run(cfg):
         log(f"Water way lines: {len(water_lines)}", cfg, force=True)
 
     # Railway
-    if "railway" in cfg.render_types:
-        railway_query = make_railway_query(cfg.bbox)
-        railway_results = fetch_from_postgis(railway_query, cfg)
+    if "railways" in cfg.render_types:
+        railways_query = make_railways_query(cfg.bbox)
+        railways_results = fetch_from_postgis(railways_query, cfg)
 
         extract_start = time.time()
-        railway_lines = extract_railway_lines(railway_results)
-        log_timing(extract_start, "Railway data extraction", cfg)
-        log(f"Railway lines: {len(railway_lines)}", cfg, force=True)
+        railways_lines = extract_railway_lines(railways_results)
+        log_timing(extract_start, "Railways data extraction", cfg)
+        log(f"Railways lines: {len(railways_lines)}", cfg, force=True)
 
     render_start = time.time()
-    out_paths = render(cfg, highway_layers, border_polygons, water_lines, railway_lines)
+    out_paths = render(
+        cfg, highway_layers, border_polygons, water_lines, railways_lines
+    )
     log_timing(render_start, "Total rendering", cfg)
 
     log_timing(total_start, "TOTAL EXECUTION TIME", cfg)
@@ -681,7 +701,7 @@ def build_arg_parser():
         "Notes: If your --bbox value starts with a negative number you must either quote it "
         "('--bbox \"-123.3,49.1,-122.9,49.35\"') or use the equals form (--bbox=-123.3,49.1,-122.9,49.35).\n"
         "Alternatively supply the four numeric components with --min-lon --min-lat --max-lon --max-lat.\n\n"
-        "Render types: roads, borders, water, railway (all are optional, default is roads and borders)"
+        "Render types: roads, borders, water, railways (all are optional, default is roads and borders)"
     )
     p = argparse.ArgumentParser(
         description="Render OSM highways + borders to various formats from PostGIS (pure Python)",
@@ -710,16 +730,11 @@ def build_arg_parser():
     p.add_argument(
         "--render",
         nargs="*",
-        choices=["roads", "borders", "water", "railway"],
-        default=["roads", "borders", "water", "railway"],
+        choices=["roads", "borders", "water", "railways"],
+        default=["roads", "borders", "water", "railways"],
         help="What to render (default: roads borders). Can specify multiple: --render roads water borders",
     )
     p.add_argument("--verbose", action="store_true")
-    p.add_argument(
-        "--disable-oiio",
-        action="store_true",
-        help="Disable oiiotool post-processing (tiling and 16-bit conversion) for EXR outputs",
-    )
     return p
 
 
@@ -758,7 +773,6 @@ def main(argv=None):
         output=Path(args.output),
         render_types=args.render,
         verbose=args.verbose,
-        disable_oiio=args.disable_oiio,
     )
 
     try:

@@ -14,7 +14,7 @@ EOF
 
 # Preprocessing Geofabrik datasets
 osmium tags-filter /Volumes/Vault/ElevationMaps/Datasets/OSM_Geofabrik/japan-latest.osm.pbf \
-  w/highway=motorway,trunk,primary,secondary w/waterway=river w/natural=water w/railway=rail w/natural=coastline \
+  w/highway=motorway,trunk,primary,secondary,tertiary w/waterway=river w/natural=water w/railway=rail w/natural=coastline \
   r/natural=water r/waterway=river r/type=multipolygon r/boundary=administrative r/admin_level=2 \
   -o /Volumes/Vault/ElevationMaps/Datasets/OSM_Geofabrik/japan-filtered.osm.pbf --overwrite
 
@@ -58,3 +58,8 @@ psql -U postgres -d osm_db << EOF
 DROP TABLE countries;
 EOF
 
+#JP bbox
+128.46,28.80,146.98,45.86
+
+# filter roads by len
+"highway" = 'trunk' AND ST_Length(way) > 20
