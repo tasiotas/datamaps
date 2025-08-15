@@ -57,3 +57,4 @@ EOF
 psql -U postgres -d osm_db << EOF
 DROP TABLE countries;
 EOF
+
