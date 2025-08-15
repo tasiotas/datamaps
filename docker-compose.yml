@@ -1,0 +1,34 @@
+volumes:
+  postgis_data:
+  pgadmin_data:
+
+services:
+  postgis:
+    image: postgis/postgis:15-3.3
+    container_name: postgis_db
+    environment:
+      POSTGRES_DB: osm_db
+      
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./data:/data  # Mount local data directory for importing files
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5433:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgis
+    restart: unless-stopped
+

@@ -1,0 +1,9 @@
+requests>=2.31.0
+Pillow>=10.3.0
+psycopg[binary]>=3.2.9
+earthengine-api>=0.1.405
+numpy>=1.26.0
+opencv-python>=4.9.0.0
+beautifulsoup4>=4.12.3
+selenium>=4.21.0
+webdriver-manager>=4.0.1
