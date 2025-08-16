@@ -83,6 +83,7 @@ class Config:
         output,
         render_types=None,
         verbose=False,
+        geojson_polygon=None,
     ):
         self.bbox = bbox  # (min_lon, min_lat, max_lon, max_lat)
         self.width = width
@@ -90,6 +91,9 @@ class Config:
         self.output = output if isinstance(output, Path) else Path(output)
         self.render_types = render_types or ["roads", "borders"]
         self.verbose = verbose
+        self.geojson_polygon = (
+            geojson_polygon  # GeoJSON polygon geometry for precise filtering
+        )
 
         # Check if output is EXR format
         self.is_exr = self.output.suffix.lower() == ".exr"
@@ -108,6 +112,47 @@ def parse_bbox(bbox_str):
     if not (min_lon < max_lon and min_lat < max_lat):
         raise ValueError("Invalid bbox coordinate ordering or extents")
     return (min_lon, min_lat, max_lon, max_lat)
+
+
+def parse_geojson_region(geojson_path):
+    """Parse GeoJSON file and extract bounding box and polygon geometry from the first polygon feature"""
+    try:
+        with open(geojson_path, "r") as f:
+            geojson_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        raise ValueError(f"Failed to read or parse GeoJSON file '{geojson_path}': {e}")
+
+    # Extract coordinates from the first feature
+    features = geojson_data.get("features", [])
+    if not features:
+        raise ValueError("No features found in GeoJSON file")
+
+    first_feature = features[0]
+    geometry = first_feature.get("geometry", {})
+    geom_type = geometry.get("type", "")
+    coordinates = geometry.get("coordinates", [])
+
+    if geom_type != "Polygon":
+        raise ValueError(f"Expected Polygon geometry, found {geom_type}")
+
+    if not coordinates or not coordinates[0]:
+        raise ValueError("Invalid polygon coordinates in GeoJSON")
+
+    # Extract exterior ring coordinates (first array in coordinates)
+    exterior_ring = coordinates[0]
+
+    # Calculate bounding box from all coordinates
+    lons = [coord[0] for coord in exterior_ring]
+    lats = [coord[1] for coord in exterior_ring]
+
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+
+    if not (min_lon < max_lon and min_lat < max_lat):
+        raise ValueError("Invalid polygon extents")
+
+    # Return both bbox and the full geometry for precise spatial queries
+    return (min_lon, min_lat, max_lon, max_lat), geometry
 
 
 def log(msg, cfg, *, force=False):
@@ -162,22 +207,38 @@ def fetch_data_parallel(cfg):
     # Prepare query tasks based on what needs to be rendered
     if "roads" in cfg.render_types:
         query_tasks.append(
-            ("highways", make_highways_query(cfg.bbox), extract_highway_lines)
+            (
+                "highways",
+                make_highways_query(cfg.bbox, cfg.geojson_polygon),
+                extract_highway_lines,
+            )
         )
 
     if "borders" in cfg.render_types:
         query_tasks.append(
-            ("borders", make_borders_query(cfg.bbox), extract_border_polygons)
+            (
+                "borders",
+                make_borders_query(cfg.bbox, cfg.geojson_polygon),
+                extract_border_polygons,
+            )
         )
 
     if "water" in cfg.render_types:
         query_tasks.append(
-            ("water", make_water_query(cfg.bbox), extract_water_features)
+            (
+                "water",
+                make_water_query(cfg.bbox, cfg.geojson_polygon),
+                extract_water_features,
+            )
         )
 
     if "railways" in cfg.render_types:
         query_tasks.append(
-            ("railways", make_railways_query(cfg.bbox), extract_railway_lines)
+            (
+                "railways",
+                make_railways_query(cfg.bbox, cfg.geojson_polygon),
+                extract_railway_lines,
+            )
         )
 
     log(
@@ -239,22 +300,36 @@ def fetch_data_parallel(cfg):
 # ---------------------- Query Construction ------------------------------ #
 
 
-def make_borders_query(bbox):
-    min_lon, min_lat, max_lon, max_lat = bbox
+def make_spatial_filter(bbox, geojson_polygon=None):
+    """Create spatial filter clause - use polygon geometry if available, otherwise bbox"""
+    if geojson_polygon:
+        # Convert GeoJSON polygon to WKT format for PostGIS
+        coords = geojson_polygon["coordinates"][0]  # exterior ring
+        wkt_coords = ", ".join([f"{lon} {lat}" for lon, lat in coords])
+        polygon_wkt = f"POLYGON(({wkt_coords}))"
+        return f"ST_Intersects(way, ST_Transform(ST_GeomFromText('{polygon_wkt}', 4326), 3857))"
+    else:
+        # Fall back to bounding box
+        min_lon, min_lat, max_lon, max_lat = bbox
+        return f"way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)"
+
+
+def make_borders_query(bbox, geojson_polygon=None):
+    spatial_filter = make_spatial_filter(bbox, geojson_polygon)
     query = f"""
     SELECT
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
         "public"."labeled_countries"
     WHERE
-        way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857);
+        {spatial_filter};
     """
     return query
 
 
-def make_highways_query(bbox):
-    min_lon, min_lat, max_lon, max_lat = bbox
+def make_highways_query(bbox, geojson_polygon=None):
     highway_filter = ", ".join([f"'{tag}'" for tag in HIGHWAY_TAGS])
+    spatial_filter = make_spatial_filter(bbox, geojson_polygon)
     query = f"""
     SELECT
         highway,
@@ -262,34 +337,34 @@ def make_highways_query(bbox):
     FROM
         "public"."osm_roads"
     WHERE
-        way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
+        {spatial_filter}
         AND "highway" IN ({highway_filter});
     """
     return query
 
 
-def make_water_query(bbox):
-    min_lon, min_lat, max_lon, max_lat = bbox
+def make_water_query(bbox, geojson_polygon=None):
+    spatial_filter = make_spatial_filter(bbox, geojson_polygon)
     query = f"""
     SELECT
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
         "public"."osm_water"
     WHERE
-        way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
+        {spatial_filter}
     """
     return query
 
 
-def make_railways_query(bbox):
-    min_lon, min_lat, max_lon, max_lat = bbox
+def make_railways_query(bbox, geojson_polygon=None):
+    spatial_filter = make_spatial_filter(bbox, geojson_polygon)
     query = f"""
     SELECT
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
         "public"."osm_railways"
     WHERE
-        way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
+        {spatial_filter}
     """
     return query
 
@@ -417,7 +492,6 @@ def draw_polygons_opencv(img, polygons, bbox, scaled_w, scaled_h, color, shift=4
     """Draw filled polygons using OpenCV with sub-pixel precision"""
     total_polygons = 0
     start_time = time.time()
-    shift_factor = 1 << shift  # 2^shift
 
     for polygon in polygons:
         if len(polygon) < 3:  # Need at least 3 points for a polygon
@@ -425,20 +499,6 @@ def draw_polygons_opencv(img, polygons, bbox, scaled_w, scaled_h, color, shift=4
 
         # Convert coordinates in batch using numpy with sub-pixel precision
         pts = lonlat_to_pixel_batch(polygon, bbox, scaled_w, scaled_h, shift)
-
-        # Simple culling - skip polygons completely outside image bounds
-        if len(pts) > 0:
-            min_x, min_y = pts.min(axis=0)
-            max_x, max_y = pts.max(axis=0)
-
-            # Convert bounds to shifted coordinate space for comparison
-            if (
-                max_x < 0
-                or min_x > (scaled_w * shift_factor)
-                or max_y < 0
-                or min_y > (scaled_h * shift_factor)
-            ):
-                continue
 
         # Draw filled polygon with OpenCV using sub-pixel precision
         if len(pts) > 2:
@@ -865,7 +925,7 @@ def build_arg_parser():
     epilog = (
         "Notes: If your --bbox value starts with a negative number you must either quote it "
         "('--bbox \"-123.3,49.1,-122.9,49.35\"') or use the equals form (--bbox=-123.3,49.1,-122.9,49.35).\n"
-        "Alternatively supply the four numeric components with --min-lon --min-lat --max-lon --max-lat.\n\n"
+        "You can also use --geojson to specify a polygon region from a GeoJSON file (overrides --bbox).\n\n"
         "Render types: roads, borders, water, railways (all are optional, default is roads and borders)"
     )
     p = argparse.ArgumentParser(
@@ -879,11 +939,12 @@ def build_arg_parser():
         default="130.36707314,32.49348870,130.85704370,32.98568071",
         help="Combined bbox 'min_lon,min_lat,max_lon,max_lat' (use equals sign for negative values: --bbox=-123.30,49.10,-122.90,49.35)",
     )
-    # Component fallback arguments (optional if --bbox provided)
-    p.add_argument("--min-lon", type=float, help="Minimum longitude (west)")
-    p.add_argument("--min-lat", type=float, help="Minimum latitude (south)")
-    p.add_argument("--max-lon", type=float, help="Maximum longitude (east)")
-    p.add_argument("--max-lat", type=float, help="Maximum latitude (north)")
+    p.add_argument(
+        "--geojson",
+        required=False,
+        type=str,
+        help="Path to GeoJSON file containing a polygon region to render (overrides --bbox if provided)",
+    )
     p.add_argument(
         "--output",
         required=False,
@@ -907,29 +968,26 @@ def main(argv=None):
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    # Determine bbox source
+    # Determine bbox source - prioritize GeoJSON if provided
     bbox = None
-    if args.bbox:
+    geojson_polygon = None
+
+    if args.geojson:
+        try:
+            bbox, geojson_polygon = parse_geojson_region(args.geojson)
+            print(f"Using region from GeoJSON file: {args.geojson}", file=sys.stderr)
+            print(f"Extracted bbox: {bbox}", file=sys.stderr)
+            print(
+                "Using precise polygon geometry for spatial filtering", file=sys.stderr
+            )
+        except ValueError as e:
+            parser.error(str(e))
+    else:
+        # Fall back to bbox argument
         try:
             bbox = parse_bbox(args.bbox)
         except ValueError as e:  # noqa: BLE001
             parser.error(str(e))
-    else:
-        components = [args.min_lon, args.min_lat, args.max_lon, args.max_lat]
-        if all(v is not None for v in components):
-            try:
-                bbox = (
-                    float(args.min_lon),
-                    float(args.min_lat),
-                    float(args.max_lon),
-                    float(args.max_lat),
-                )
-            except Exception as e:  # noqa: BLE001
-                parser.error(f"Invalid numeric bbox components: {e}")
-        else:
-            parser.error(
-                "You must supply either --bbox or all four of --min-lon --min-lat --max-lon --max-lat"
-            )
 
     cfg = Config(
         bbox=bbox,
@@ -938,6 +996,7 @@ def main(argv=None):
         output=Path(args.output),
         render_types=args.render,
         verbose=args.verbose,
+        geojson_polygon=geojson_polygon,
     )
 
     try:
