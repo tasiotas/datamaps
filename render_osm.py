@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -60,16 +61,16 @@ HIGHWAY_TAGS = [
 ]
 
 LAYER_STYLES = {
-    "borders": {"thickness": 6, "color": 0},  # Dark gray for borders
+    "borders": {"thickness": 6, "color": 1},  # Dark gray for borders
     #
-    "motorway": {"thickness": 2, "color": 0},  # Very dark gray (main roads)
-    "trunk": {"thickness": 1, "color": 0},  # Dark gray
-    "primary": {"thickness": 1, "color": 0.2},  # Medium-dark gray
-    "secondary": {"thickness": 1, "color": 0.4},  # Medium gray
-    "tertiary": {"thickness": 1, "color": 0.8},  # Lighter gray (brighter)
+    "motorway": {"thickness": 2, "color": 1},  # Very dark gray (main roads)
+    "trunk": {"thickness": 1, "color": 1},  # Dark gray
+    "primary": {"thickness": 1, "color": 0.8},  # Medium-dark gray
+    "secondary": {"thickness": 1, "color": 0.6},  # Medium gray
+    "tertiary": {"thickness": 1, "color": 0.2},  # Lighter gray (brighter)
     #
-    "water": {"thickness": 2, "color": 0},  # Medium-dark gray for water
-    "railways": {"thickness": 1, "color": 0},  # Dark gray for railways
+    "water": {"thickness": 1, "color": 1},  # Medium-dark gray for water
+    "railways": {"thickness": 1, "color": 1},  # Dark gray for railways
 }
 
 
@@ -154,6 +155,87 @@ def fetch_from_postgis(query, cfg):
         raise RuntimeError(f"PostGIS query failed: {e}")
 
 
+def fetch_data_parallel(cfg):
+    """Fetch all required data types in parallel"""
+    query_tasks = []
+
+    # Prepare query tasks based on what needs to be rendered
+    if "roads" in cfg.render_types:
+        query_tasks.append(
+            ("highways", make_highways_query(cfg.bbox), extract_highway_lines)
+        )
+
+    if "borders" in cfg.render_types:
+        query_tasks.append(
+            ("borders", make_borders_query(cfg.bbox), extract_border_polygons)
+        )
+
+    if "water" in cfg.render_types:
+        query_tasks.append(
+            ("water", make_water_query(cfg.bbox), extract_water_features)
+        )
+
+    if "railways" in cfg.render_types:
+        query_tasks.append(
+            ("railways", make_railways_query(cfg.bbox), extract_railway_lines)
+        )
+
+    log(
+        f"[Data] Starting {len(query_tasks)} parallel database queries...",
+        cfg,
+        force=True,
+    )
+
+    # Execute queries in parallel
+    results = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Submit all queries
+        future_to_task = {}
+        for task_name, query, extract_func in query_tasks:
+            log(f"[Data] Submitting {task_name} query...", cfg)
+            future = executor.submit(fetch_from_postgis, query, cfg)
+            future_to_task[future] = (task_name, extract_func)
+
+        # Collect results as they complete
+        completed_count = 0
+        for future in as_completed(future_to_task):
+            task_name, extract_func = future_to_task[future]
+            try:
+                query_results = future.result()
+                extract_start = time.time()
+                extracted_data = extract_func(query_results)
+                log_timing(extract_start, f"{task_name} data extraction", cfg)
+                results[task_name] = extracted_data
+                completed_count += 1
+
+                # Log extracted data counts
+                if task_name == "highways":
+                    totals = {k: len(v) for k, v in extracted_data.items()}
+                    log(f"Highway line counts: {totals}", cfg, force=True)
+                elif task_name == "borders":
+                    log(f"Border polygons: {len(extracted_data)}", cfg, force=True)
+                elif task_name == "water":
+                    lines, polygons = extracted_data
+                    log(
+                        f"Water lines: {len(lines)}, Water polygons: {len(polygons)}",
+                        cfg,
+                        force=True,
+                    )
+                elif task_name == "railways":
+                    log(f"Railways lines: {len(extracted_data)}", cfg, force=True)
+
+                log(
+                    f"[Data] Completed {task_name} ({completed_count}/{len(query_tasks)})",
+                    cfg,
+                )
+
+            except Exception as e:
+                log(f"[ERROR] Failed to fetch {task_name}: {e}", cfg, force=True)
+                results[task_name] = None
+
+    return results
+
+
 # ---------------------- Query Construction ------------------------------ #
 
 
@@ -192,11 +274,9 @@ def make_water_query(bbox):
     SELECT
         ST_AsGeoJSON(ST_Transform(way, 4326)) AS geom
     FROM
-        "public"."osm_waterways"
+        "public"."osm_water"
     WHERE
         way && ST_Transform(ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326), 3857)
-        AND "waterway" = 'river'
-        AND ST_Length(way) > 90;
     """
     return query
 
@@ -251,15 +331,36 @@ def extract_border_polygons(results):
     return polygons
 
 
-def extract_water_lines(results):
+def extract_water_features(results):
+    """Extract water features, separating lines (rivers) from polygons (lakes)"""
     lines = []
+    polygons = []
+
     for row in results:
         geom_json = json.loads(row["geom"])
+        geom_type = geom_json.get("type", "")
         coords = geom_json.get("coordinates", [])
-        if len(coords) < 2:
-            continue
-        lines.append(coords)
-    return lines
+
+        if geom_type == "LineString":
+            # LineString: coordinates = [[lon, lat], [lon, lat], ...]
+            if len(coords) >= 2:
+                lines.append(coords)
+        elif geom_type == "MultiLineString":
+            # MultiLineString: coordinates = [[[lon, lat], [lon, lat], ...], ...]
+            for line_coords in coords:
+                if len(line_coords) >= 2:
+                    lines.append(line_coords)
+        elif geom_type == "Polygon":
+            # Polygon: coordinates = [[[lon, lat], [lon, lat], ...]] (exterior ring only)
+            if coords and len(coords[0]) >= 3:
+                polygons.append(coords[0])
+        elif geom_type == "MultiPolygon":
+            # MultiPolygon: coordinates = [[[[lon, lat], [lon, lat], ...]], ...]
+            for polygon in coords:
+                if polygon and len(polygon[0]) >= 3:
+                    polygons.append(polygon[0])
+
+    return lines, polygons
 
 
 def extract_railway_lines(results):
@@ -282,7 +383,26 @@ def lonlat_to_pixel_batch(coords, bbox, w, h, shift=4):
     lon_range = max_lon - min_lon
     lat_range = max_lat - min_lat
 
-    coords_array = np.array(coords)
+    # Ensure coords is a proper 2D array with consistent shape
+    try:
+        coords_array = np.array(coords)
+
+        # Validate that we have at least 2D coordinates
+        if coords_array.ndim != 2 or coords_array.shape[1] != 2:
+            # Try to handle inconsistent coordinate formats
+            valid_coords = []
+            for coord in coords:
+                if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                    valid_coords.append([float(coord[0]), float(coord[1])])
+
+            if not valid_coords:
+                return np.array([], dtype=np.int32).reshape(0, 2)
+
+            coords_array = np.array(valid_coords)
+    except (ValueError, TypeError):
+        # Handle malformed coordinate data
+        return np.array([], dtype=np.int32).reshape(0, 2)
+
     shift_factor = 1 << shift
 
     # Keep floating point precision for sub-pixel accuracy
@@ -341,6 +461,7 @@ def draw_lines_opencv(img, lines, bbox, scaled_w, scaled_h, thickness, color, sh
         # Convert coordinates in batch using numpy with sub-pixel precision
         pts = lonlat_to_pixel_batch(line, bbox, scaled_w, scaled_h, shift)
 
+        # Check if we have valid points to draw
         if len(pts) > 1:
             cv2.polylines(
                 img,
@@ -358,11 +479,17 @@ def draw_lines_opencv(img, lines, bbox, scaled_w, scaled_h, thickness, color, sh
 
 
 def render_single_layer(
-    cfg, layer_name, highway_layers, border_polygons, water_lines, railways_lines
+    cfg,
+    layer_name,
+    highway_layers,
+    border_polygons,
+    water_lines,
+    water_polygons,
+    railways_lines,
 ):
     """Render a single layer type to its own image"""
-    # Create OpenCV image (32-bit float format, white background) for better antialiasing visibility
-    img = np.full((cfg.height, cfg.width, 3), 255, dtype=np.uint8)
+    # Create OpenCV image (32-bit float format, black background) for better antialiasing visibility
+    img = np.full((cfg.height, cfg.width, 3), 0, dtype=np.uint8)
 
     # Pre-calculate bbox values for performance
     bbox_cached = cfg.bbox
@@ -408,23 +535,45 @@ def render_single_layer(
 
         log_timing(roads_start, "Total roads rendering", cfg)
 
-    elif layer_name == "water" and water_lines:
-        log(f"[Render] Drawing {len(water_lines)} water lines...", cfg)
+    elif layer_name == "water" and (water_lines or water_polygons):
         layer_style = LAYER_STYLES["water"]
         thickness = layer_style["thickness"]
         color = grayscale_to_bgr(layer_style["color"])
 
         water_start = time.time()
-        drawn_count, draw_time = draw_lines_opencv(
-            img,
-            water_lines,
-            bbox_cached,
-            cfg.width,
-            cfg.height,
-            thickness,
-            color,
-        )
-        log_timing(water_start, f"Water rendering ({drawn_count} lines)", cfg)
+        total_drawn = 0
+
+        # Draw water polygons (lakes, ponds) as filled shapes
+        if water_polygons:
+            log(
+                f"[Render] Drawing {len(water_polygons)} water polygons (filled)...",
+                cfg,
+            )
+            drawn_polygons, _ = draw_polygons_opencv(
+                img,
+                water_polygons,
+                bbox_cached,
+                cfg.width,
+                cfg.height,
+                color,
+            )
+            total_drawn += drawn_polygons
+
+        # Draw water lines (rivers, streams) as strokes
+        if water_lines:
+            log(f"[Render] Drawing {len(water_lines)} water lines...", cfg)
+            drawn_lines, _ = draw_lines_opencv(
+                img,
+                water_lines,
+                bbox_cached,
+                cfg.width,
+                cfg.height,
+                thickness,
+                color,
+            )
+            total_drawn += drawn_lines
+
+        log_timing(water_start, f"Water rendering ({total_drawn} features)", cfg)
 
     elif layer_name == "railways" and railways_lines:
         log(f"[Render] Drawing {len(railways_lines)} railways lines...", cfg)
@@ -565,51 +714,93 @@ def render_single_layer(
         return final_output_path
 
 
-def render(cfg, highway_layers, border_polygons, water_lines, railways_lines):
-    """Render all requested layers to separate files"""
-    output_paths = []
+def render(
+    cfg, highway_layers, border_polygons, water_lines, water_polygons, railways_lines
+):
+    """Render all requested layers to separate files in parallel"""
+
+    # Prepare rendering tasks
+    render_tasks = []
 
     for layer_name in cfg.render_types:
-        if layer_name == "roads" and any(highway_layers.values()):
-            path = render_single_layer(
-                cfg,
-                layer_name,
-                highway_layers,
-                border_polygons,
-                water_lines,
-                railways_lines,
+        if layer_name == "roads" and highway_layers and any(highway_layers.values()):
+            render_tasks.append(
+                (
+                    layer_name,
+                    highway_layers,
+                    border_polygons,
+                    water_lines,
+                    water_polygons,
+                    railways_lines,
+                )
             )
-            output_paths.append(path)
-        elif layer_name == "water" and water_lines:
-            path = render_single_layer(
-                cfg,
-                layer_name,
-                highway_layers,
-                border_polygons,
-                water_lines,
-                railways_lines,
+        elif layer_name == "water" and (water_lines or water_polygons):
+            render_tasks.append(
+                (
+                    layer_name,
+                    highway_layers,
+                    border_polygons,
+                    water_lines,
+                    water_polygons,
+                    railways_lines,
+                )
             )
-            output_paths.append(path)
         elif layer_name == "railways" and railways_lines:
-            path = render_single_layer(
-                cfg,
-                layer_name,
-                highway_layers,
-                border_polygons,
-                water_lines,
-                railways_lines,
+            render_tasks.append(
+                (
+                    layer_name,
+                    highway_layers,
+                    border_polygons,
+                    water_lines,
+                    water_polygons,
+                    railways_lines,
+                )
             )
-            output_paths.append(path)
         elif layer_name == "borders" and border_polygons:
-            path = render_single_layer(
-                cfg,
-                layer_name,
-                highway_layers,
-                border_polygons,
-                water_lines,
-                railways_lines,
+            render_tasks.append(
+                (
+                    layer_name,
+                    highway_layers,
+                    border_polygons,
+                    water_lines,
+                    water_polygons,
+                    railways_lines,
+                )
             )
-            output_paths.append(path)
+
+    log(
+        f"[Render] Starting {len(render_tasks)} parallel rendering tasks...",
+        cfg,
+        force=True,
+    )
+
+    # Render layers in parallel
+    output_paths = []
+    if render_tasks:
+        with ThreadPoolExecutor(max_workers=min(len(render_tasks), 4)) as executor:
+            # Submit all rendering tasks
+            future_to_layer = {}
+            for task_args in render_tasks:
+                layer_name = task_args[0]
+                log(f"[Render] Submitting {layer_name} rendering task...", cfg)
+                future = executor.submit(render_single_layer, cfg, *task_args)
+                future_to_layer[future] = layer_name
+
+            # Collect results as they complete
+            completed_count = 0
+            for future in as_completed(future_to_layer):
+                layer_name = future_to_layer[future]
+                try:
+                    output_path = future.result()
+                    output_paths.append(output_path)
+                    completed_count += 1
+                    log(
+                        f"[Render] Completed {layer_name} layer ({completed_count}/{len(render_tasks)}): {output_path}",
+                        cfg,
+                        force=True,
+                    )
+                except Exception as e:
+                    log(f"[ERROR] Failed to render {layer_name}: {e}", cfg, force=True)
 
     return output_paths
 
@@ -623,59 +814,33 @@ def run(cfg):
     log(f"Output: {cfg.output}", cfg)
     log(f"Rendering: {', '.join(cfg.render_types)}", cfg, force=True)
 
-    # Initialize data containers
-    highway_layers = {tag: [] for tag in HIGHWAY_TAGS}
-    border_polygons = []
-    water_lines = []
-    railways_lines = []
+    # Fetch all required data in parallel
+    log("[Data] Starting parallel data fetch...", cfg)
+    fetch_start = time.time()
+    data_results = fetch_data_parallel(cfg)
+    log_timing(fetch_start, "Total parallel data fetch", cfg)
 
-    # Highways
-    if "roads" in cfg.render_types:
-        highway_query = make_highways_query(cfg.bbox)
-        highway_results = fetch_from_postgis(highway_query, cfg)
+    # Extract data from results with defaults
+    highway_layers = data_results.get("highways", {tag: [] for tag in HIGHWAY_TAGS})
+    border_polygons = data_results.get("borders", [])
+    water_data = data_results.get("water", ([], []))
+    water_lines, water_polygons = (
+        water_data if isinstance(water_data, tuple) else (water_data, [])
+    )
+    railways_lines = data_results.get("railways", [])
 
-        extract_start = time.time()
-        highway_layers = extract_highway_lines(highway_results)
-        log_timing(extract_start, "Highway data extraction", cfg)
-
-        totals = {k: len(v) for k, v in highway_layers.items()}
-        log(f"Highway line counts: {totals}", cfg, force=True)
-
-    # Borders
-    if "borders" in cfg.render_types:
-        border_query = make_borders_query(cfg.bbox)
-        border_results = fetch_from_postgis(border_query, cfg)
-
-        extract_start = time.time()
-        border_polygons = extract_border_polygons(border_results)
-        log_timing(extract_start, "Border data extraction", cfg)
-        log(f"Border polygons: {len(border_polygons)}", cfg, force=True)
-
-    # Water
-    if "water" in cfg.render_types:
-        water_query = make_water_query(cfg.bbox)
-        water_results = fetch_from_postgis(water_query, cfg)
-
-        extract_start = time.time()
-        water_lines = extract_water_lines(water_results)
-        log_timing(extract_start, "Water data extraction", cfg)
-        log(f"Water way lines: {len(water_lines)}", cfg, force=True)
-
-    # Railway
-    if "railways" in cfg.render_types:
-        railways_query = make_railways_query(cfg.bbox)
-        railways_results = fetch_from_postgis(railways_query, cfg)
-
-        extract_start = time.time()
-        railways_lines = extract_railway_lines(railways_results)
-        log_timing(extract_start, "Railways data extraction", cfg)
-        log(f"Railways lines: {len(railways_lines)}", cfg, force=True)
-
+    # Start parallel rendering
+    log("[Render] Starting parallel rendering...", cfg)
     render_start = time.time()
     out_paths = render(
-        cfg, highway_layers, border_polygons, water_lines, railways_lines
+        cfg,
+        highway_layers,
+        border_polygons,
+        water_lines,
+        water_polygons,
+        railways_lines,
     )
-    log_timing(render_start, "Total rendering", cfg)
+    log_timing(render_start, "Total parallel rendering", cfg)
 
     log_timing(total_start, "TOTAL EXECUTION TIME", cfg)
 
