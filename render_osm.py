@@ -61,16 +61,16 @@ HIGHWAY_TAGS = [
 ]
 
 LAYER_STYLES = {
-    "borders": {"thickness": 6, "color": 1},  # Dark gray for borders
+    "borders": {"thickness": 6, "color": 1},
     #
-    "motorway": {"thickness": 2, "color": 1},  # Very dark gray (main roads)
-    "trunk": {"thickness": 1, "color": 1},  # Dark gray
-    "primary": {"thickness": 1, "color": 0.8},  # Medium-dark gray
-    "secondary": {"thickness": 1, "color": 0.6},  # Medium gray
-    "tertiary": {"thickness": 1, "color": 0.2},  # Lighter gray (brighter)
+    "motorway": {"thickness": 2, "color": 1},
+    "trunk": {"thickness": 1, "color": 1},
+    "primary": {"thickness": 1, "color": 0.8},
+    "secondary": {"thickness": 1, "color": 0.6},
+    "tertiary": {"thickness": 1, "color": 0.2},
     #
-    "water": {"thickness": 1, "color": 1},  # Medium-dark gray for water
-    "railways": {"thickness": 1, "color": 1},  # Dark gray for railways
+    "water": {"thickness": 1, "color": 0.5},
+    "railways": {"thickness": 1, "color": 1},
 }
 
 
@@ -951,8 +951,15 @@ def build_arg_parser():
         default="output/kumamoto.exr",
         help="Output file path (supports .exr, .png, .webp)",
     )
-    p.add_argument("--width", type=int, default=2048)
-    p.add_argument("--height", type=int, default=2048)
+    p.add_argument(
+        "--width", type=int, default=2048, help="Image width in pixels (default: 2048)"
+    )
+    p.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Image height in pixels. If not provided, will be calculated from width based on bbox/geojson aspect ratio",
+    )
     p.add_argument(
         "--render",
         nargs="*",
@@ -989,10 +996,26 @@ def main(argv=None):
         except ValueError as e:  # noqa: BLE001
             parser.error(str(e))
 
+    # Calculate height based on bbox aspect ratio if not provided
+    width = args.width
+    height = args.height
+
+    if height is None:
+        # Calculate height based on bbox aspect ratio
+        min_lon, min_lat, max_lon, max_lat = bbox
+        bbox_width = max_lon - min_lon
+        bbox_height = max_lat - min_lat
+        aspect_ratio = bbox_height / bbox_width
+        height = int(width * aspect_ratio)
+        print(
+            f"Calculated height from bbox aspect ratio: {height} pixels (aspect ratio: {aspect_ratio:.3f})",
+            file=sys.stderr,
+        )
+
     cfg = Config(
         bbox=bbox,
-        width=args.width,
-        height=args.height,
+        width=width,
+        height=height,
         output=Path(args.output),
         render_types=args.render,
         verbose=args.verbose,

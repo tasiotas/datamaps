@@ -13,7 +13,6 @@ local roads_table = osm2pgsql.define_table {
 local railways_table = osm2pgsql.define_table {
     name = 'osm_railways',
     columns = {
-        { column = 'railway', type = 'text', not_null = true },
         { column = 'way', type = 'geometry', projection = 3857, not_null = true }
     }
 }
@@ -21,8 +20,6 @@ local railways_table = osm2pgsql.define_table {
 local natural_features_table = osm2pgsql.define_table {
     name = 'osm_water',
     columns = {
-        { column = 'natural', type = 'text', not_null = true },
-        { column = 'name', type = 'text' },
         { column = 'way', type = 'geometry', projection = 3857, not_null = true }
     }
 }
@@ -30,8 +27,6 @@ local natural_features_table = osm2pgsql.define_table {
 local boundaries_table = osm2pgsql.define_table {
     name = 'osm_boundaries',
     columns = {
-        -- { column = 'boundary', type = 'text', not_null = true },
-        -- { column = 'name', type = 'text' },
         { column = 'iso_3166_1', type = 'text' },
         { column = 'way', type = 'geometry', projection = 3857, not_null = true }
     }
@@ -46,20 +41,16 @@ local function insert_road(object, highway_type)
     roads_table:insert(row)
 end
 
-local function insert_railway(object, railway_type)
+local function insert_railway(object)
     local row = {
-        railway = railway_type,
-        name = object.tags.name,
         way = object:as_linestring()
     }
     
     railways_table:insert(row)
 end
 
-local function insert_water(object, waterway_type, natural_type)
+local function insert_water(object, natural_type)
     local row = {
-        natural = natural_type or waterway_type,  -- Use natural_type if available, otherwise waterway_type
-        name = object.tags.name
     }
     
     -- Handle geometry based on object type and feature type
@@ -82,24 +73,10 @@ end
 
 local function insert_boundary(object, boundary_type, admin_level, object_type)
     local row = {
-        -- boundary = boundary_type,
-        -- name = object.tags.name,
         iso_3166_1 = object.tags['ISO3166-1'],
         way = object:as_multipolygon()
     }
-    
-    -- -- Handle geometry based on object type
-    -- if object.tags and object.tags.type == 'multipolygon' then
-    --     row.way = object:as_multipolygon()
-    -- else
-    --     -- For ways, use linestring; for relations, use multipolygon
-    --     if object_type == 'way' then
-    --         row.way = object:as_linestring()
-    --     else
-    --         row.way = object:as_multipolygon()
-    --     end
-    -- end
-    
+        
     boundaries_table:insert(row)
 end
 
@@ -126,21 +103,16 @@ function osm2pgsql.process_way(object)
 
     -- Railways
     if tags.railway == 'rail' then
-        insert_railway(object, tags.railway)
+        insert_railway(object)
         return
     end
 
     -- Waterways and water features
     if tags.waterway == 'river' or tags.natural == 'water' then
-        insert_water(object, tags.waterway, tags.natural)
+        insert_water(object, tags.natural)
         return
     end
 
-    -- -- Administrative boundaries
-    -- if tags.boundary == 'administrative' and tags.admin_level == '2' then
-    --     insert_boundary(object, tags.boundary, tags.admin_level, 'way')
-    --     return
-    -- end
 end
 
 -- Process relations
@@ -154,13 +126,13 @@ function osm2pgsql.process_relation(object)
     
     -- Railways
     if tags.railway == 'rail' then
-        insert_railway(object, tags.railway)
+        insert_railway(object)
         return
     end
 
     -- Waterways and water features
     if tags.waterway == 'river' or tags.natural == 'water' then
-        insert_water(object, tags.waterway, tags.natural)
+        insert_water(object, tags.natural)
         return
     end
 

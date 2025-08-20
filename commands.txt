@@ -14,49 +14,28 @@ EOF
 
 # Preprocessing Geofabrik datasets
 osmium tags-filter /Volumes/Vault/ElevationMaps/Datasets/OSM_Geofabrik/japan-latest.osm.pbf \
-  w/highway=motorway,trunk,primary,secondary,tertiary w/waterway=river w/natural=water w/railway=rail w/natural=coastline \
+  w/highway=motorway,trunk,primary,secondary,tertiary w/waterway=river w/natural=water w/railway=rail \
   r/natural=water r/waterway=river r/type=multipolygon r/boundary=administrative r/admin_level=2 \
   -o /Volumes/Vault/ElevationMaps/Datasets/OSM_Geofabrik/japan-filtered.osm.pbf --overwrite
 
-# Importing Geofabrik into PostGIS
-osm2pgsql -H 192.168.1.3 -P 5432 -U postgres -O flex -S "F:\ElevationMaps\Datasets\OSM_Geofabrik\minimal.lua" `
-  -d osm_db --number-processes --cache 32000  20 --slim --drop `
-  .\japan-filtered.osm.pbf
-
 # Importing Geofabrik into PostGIS without slim, faster but more memory-intensive
 osm2pgsql -H 192.168.1.3 -P 5432 -U postgres `
-  -O flex -S "F:\ElevationMaps\Datasets\OSM_Geofabrik\minimal.lua" `
+  -O flex -S "F:\ElevationMaps\Datasets\OSM_Geofabrik\ingest_separated.lua" `
   -d osm_db --number-processes 20 `
   .\japan-filtered.osm.pbf
 
+# Importing Geofabrik into PostGIS - slim mode for larger datasets
+osm2pgsql -H 192.168.1.3 -P 5432 -U postgres -O flex -S "F:\ElevationMaps\Datasets\OSM_Geofabrik\ingest_separated.lua" `
+  -d osm_db --number-processes --cache 32000  20 --slim --drop `
+  .\japan-filtered.osm.pbf
 
 # Importing OSMData Country Polygons into PostGis
 ogr2ogr -f "PostgreSQL" PG:"host=192.168.1.3 port=5432 user=postgres dbname=osm_db" `
   "F:\ElevationMaps\Datasets\OSMData\land-polygons-complete-3857\land_polygons.shp" `
   -nln countries -overwrite -nlt MULTIPOLYGON
 
-
-# create labeled countries
-psql -U postgres -d osm_db << EOF
-CREATE TABLE labeled_countries AS
-SELECT
-    c.wkb_geometry AS way,
-    l.name,
-    l.iso_3166_1
-FROM
-    countries c
-JOIN
-    osm_boundaries l
-ON
-    ST_Intersects(c.wkb_geometry, l.way)
-WHERE
-    l.iso_3166_1 IS NOT NULL;
-EOF
-
-# Drop countries
-psql -U postgres -d osm_db << EOF
-DROP TABLE countries;
-EOF
+# post ingestion SQL
+psql-17 -h 192.168.1.3 -d osm_db -U postgres -f /Users/tas/Documents/qgis/post_ingest.sql
 
 #JP bbox
 128.46,28.80,146.98,45.86
