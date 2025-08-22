@@ -42,3 +42,16 @@ psql-17 -h 192.168.1.3 -d osm_db -U postgres -f /Users/tas/Documents/qgis/post_i
 
 # filter roads by len
 "highway" = 'trunk' AND ST_Length(way) > 20
+
+
+# Elevation maps - 2x the resolution
+gdalwarp -cutline "F:\ElevationMaps\Projects\1_Japan\textures\map.geojson" `
+  -crop_to_cutline -ot Float32 -co COMPRESS=ZIP -ts 28800 0 -r lanczos `
+  "F:\ElevationMaps\Datasets\AW3D30\aw3d30.vrt" `
+  -overwrite F:\ElevationMaps\Projects\1_Japan\textures\japan_elevation_28800_32.tif
+
+# OIIOTOOL on elevation map
+oiiotool `
+  /Volumes/Vault/ElevationMaps/Projects/1_Japan/textures/japan_elevation_28800_32.tif `
+  -d half -compression zip `
+  -otex /Volumes/Vault/ElevationMaps/Projects/1_Japan/textures/japan_elevation_28800_16.exr

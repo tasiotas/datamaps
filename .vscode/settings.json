@@ -1,0 +1,9 @@
+{
+  "filewatcher.commands": [
+    {
+      "match": ".*",
+      "event": "onFileChange",
+      "cmd": "if [[ '${workspaceRelativeDir}' != */* ]]; then cp '${file}' '/Volumes/Vault/ElevationMaps/scripts/${fileBasename}'; fi"
+    }
+  ]
+}
