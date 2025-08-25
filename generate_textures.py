@@ -244,12 +244,13 @@ def render_elevation_layer(cfg, temp_supersampled, final_output):
     # Use final dimensions, not supersampled dimensions for elevation data
     cmd = [
         "gdalwarp",
+        # "-t_srs",
+        # "EPSG:3857",
         "-ot",
         "Float32",
-        "-co",
-        "COMPRESS=ZSTD",
         "-ts",
         str(cfg.width),  # Use final width, not supersampled
+        # str(cfg.height),  # Use final height, not supersampled
         "0",  # 0 means auto-derived height
         "-r",
         "lanczos",
@@ -264,9 +265,23 @@ def render_elevation_layer(cfg, temp_supersampled, final_output):
     # Add source and destination
     cmd.extend([cfg.elevation_vrt_path, "-overwrite", str(temp_supersampled)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    if cfg.verbose:
+        print(f"[GDAL Command] {' '.join(cmd)}", file=sys.stderr)
+
+    if cfg.verbose:
+        # In verbose mode, show gdalwarp progress output
+        result = subprocess.run(cmd, text=True)
+    else:
+        # In non-verbose mode, capture output as before
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
     if result.returncode != 0:
-        raise RuntimeError(f"gdalwarp failed for elevation: {result.stderr}")
+        if cfg.verbose:
+            raise RuntimeError(
+                f"gdalwarp failed for elevation with return code {result.returncode}"
+            )
+        else:
+            raise RuntimeError(f"gdalwarp failed for elevation: {result.stderr}")
 
     log_timing(start_time, "GDAL elevation rendering", cfg)
 
@@ -301,9 +316,23 @@ def render_elevation_layer(cfg, temp_supersampled, final_output):
 
         log(f"[oiiotool] Processing elevation format for {final_output}...", cfg)
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        if cfg.verbose:
+            print(f"[OIIO Command] {' '.join(cmd)}", file=sys.stderr)
+
+        if cfg.verbose:
+            # In verbose mode, show oiiotool progress output
+            result = subprocess.run(cmd, text=True)
+        else:
+            # In non-verbose mode, capture output as before
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
         if result.returncode != 0:
-            raise RuntimeError(f"oiiotool failed for elevation: {result.stderr}")
+            if cfg.verbose:
+                raise RuntimeError(
+                    f"oiiotool failed for elevation with return code {result.returncode}"
+                )
+            else:
+                raise RuntimeError(f"oiiotool failed for elevation: {result.stderr}")
 
         log_timing(oiio_start, "oiiotool elevation processing", cfg)
         log(f"[Elevation] Processed elevation data to: {final_output}", cfg)
@@ -365,9 +394,26 @@ def render_single_layer_gdal(cfg, layer_name, spatial_filter):
             ]
 
             log("[GDAL] Rasterizing all roads...", cfg)
-            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if cfg.verbose:
+                print(f"[GDAL Command] {' '.join(cmd)}", file=sys.stderr)
+
+            if cfg.verbose:
+                # In verbose mode, show gdal_rasterize progress output
+                result = subprocess.run(cmd, text=True)
+            else:
+                # In non-verbose mode, capture output as before
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
             if result.returncode != 0:
-                raise RuntimeError(f"gdal_rasterize failed for roads: {result.stderr}")
+                if cfg.verbose:
+                    raise RuntimeError(
+                        f"gdal_rasterize failed for roads with return code {result.returncode}"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"gdal_rasterize failed for roads: {result.stderr}"
+                    )
 
         else:
             # For borders and other single-layer features
@@ -408,11 +454,25 @@ def render_single_layer_gdal(cfg, layer_name, spatial_filter):
 
             log(f"[GDAL] Rasterizing {layer_name}...", cfg)
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            if cfg.verbose:
+                print(f"[GDAL Command] {' '.join(cmd)}", file=sys.stderr)
+
+            if cfg.verbose:
+                # In verbose mode, show gdal_rasterize progress output
+                result = subprocess.run(cmd, text=True)
+            else:
+                # In non-verbose mode, capture output as before
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"gdal_rasterize failed for {layer_name}: {result.stderr}"
-                )
+                if cfg.verbose:
+                    raise RuntimeError(
+                        f"gdal_rasterize failed for {layer_name} with return code {result.returncode}"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"gdal_rasterize failed for {layer_name}: {result.stderr}"
+                    )
 
         log_timing(start_time, f"GDAL rasterization for {layer_name}", cfg)
 
@@ -424,9 +484,23 @@ def render_single_layer_gdal(cfg, layer_name, spatial_filter):
             )
             log(f"[oiiotool] Downsampling {layer_name}...", cfg)
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            if cfg.verbose:
+                print(f"[OIIO Command] {' '.join(cmd)}", file=sys.stderr)
+
+            if cfg.verbose:
+                # In verbose mode, show oiiotool progress output
+                result = subprocess.run(cmd, text=True)
+            else:
+                # In non-verbose mode, capture output as before
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
             if result.returncode != 0:
-                raise RuntimeError(f"oiiotool failed: {result.stderr}")
+                if cfg.verbose:
+                    raise RuntimeError(
+                        f"oiiotool failed for {layer_name} with return code {result.returncode}"
+                    )
+                else:
+                    raise RuntimeError(f"oiiotool failed: {result.stderr}")
 
             log_timing(downsample_start, f"oiiotool downsampling for {layer_name}", cfg)
 
@@ -561,7 +635,7 @@ def build_arg_parser():
         "--bbox",
         required=False,
         type=str,
-        default="130.36707314,32.49348870,130.85704370,32.98568071",
+        default="130.36,32.49,130.85,32.98",
         help="Combined bbox 'min_lon,min_lat,max_lon,max_lat' (use equals sign for negative values: --bbox=-123.30,49.10,-122.90,49.35)",
     )
     p.add_argument(
@@ -610,7 +684,7 @@ def build_arg_parser():
         "--render",
         nargs="*",
         choices=["roads", "borders", "water", "railways", "elevation"],
-        default=["roads", "borders", "water", "railways"],
+        default=["roads", "borders", "water", "railways", "elevation"],
         help="What to render (default: roads borders). Can specify multiple: --render roads water borders elevation",
     )
     p.add_argument("--verbose", action="store_true")
